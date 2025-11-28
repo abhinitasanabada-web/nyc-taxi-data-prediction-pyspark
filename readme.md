@@ -2,108 +2,135 @@
 
 This project implements an end-to-end analytics pipeline for NYC Yellow Taxi data using:
 
-- **Apache Airflow** – orchestration
-- **PySpark** – batch ETL for historical trips
-- **Snowflake** – data warehouse
-- **OpenWeather API** – real-time weather feed (second data source)
+- **Apache Airflow** – orchestration  
+- **PySpark** – batch ETL for historical trips  
+- **Snowflake** – data warehouse  
+- **OpenWeather API** – near real-time weather feed  
 
-The output of this layer is used by dbt models and BI dashboards for analysis and forecasting.
-
----
-
-## High-Level Architecture
-
-**Data sources**
-
-- **Historical:** NYC TLC Yellow Taxi trip data (Parquet), one file per month.
-- **Real-time:** Current weather data for New York City from the **OpenWeather** API.
-
-**Processing**
-
-1. **Batch ETL DAG** (`nyc_taxi_pyspark_etl`)
-   - Discovers the most recent available NYC TLC Parquet file for the current year.
-   - Downloads and transforms the data with PySpark.
-   - Writes a cleaned CSV extract to `/tmp` inside the Airflow container.
-   - Loads into Snowflake using `PUT` + `COPY INTO` + `MERGE` into a fact table.
-
-2. **Real-time Weather DAG** (`nyc_weather_realtime_etl`)
-   - Periodically calls the OpenWeather API for current weather in NYC.
-   - Parses temperature / humidity / description.
-   - Inserts one row per run into a Snowflake table for weather observations.
-
-**Storage**
-
-All data lands in a Snowflake **raw schema** (e.g. `RAW`) as:
-
-- `RAW.NYC_TAXI_TRIPS` – historical taxi trips (fact table)
-- `RAW.NYC_TAXI_TRIPS_STG` – staging table for COPY/MERGE
-- `RAW.RAW_WEATHER` – real-time weather observations
+The data from these pipelines is later modeled in dbt and visualized in BI tools.
 
 ---
 
-## Historical NYC Taxi ETL (Batch)
+## Architecture Overview
 
-**DAG:** `nyc_taxi_pyspark_etl`  
-**File:** `dags/etl_spark_historical.py`
+### Data Sources
 
-### What it does
+- **Historical:** NYC TLC Yellow Taxi trip data (monthly Parquet files).  
+- **Real-time:** Current weather in New York City from the OpenWeather API.
 
-1. **Find latest month in current year**
-   - Builds URLs like  
-     `yellow_tripdata_YYYY-MM.parquet`  
-     under the public TLC CloudFront endpoint.
-   - Sends `HEAD` requests from the Airflow task to find the most recent existing month.
+### Airflow DAGs
 
-2. **Download & transform with PySpark**
-   - Downloads the Parquet file to `/tmp` inside the Airflow container.
-   - Starts a local Spark session (`master=local[*]`).
-   - Reads the Parquet and selects / casts relevant columns:
+1. **Historical ETL – `nyc_taxi_pyspark_etl`**
+   - Finds the most recent available TLC Parquet file for the current year by probing month URLs.
+   - Downloads and cleans it with PySpark (filters invalid rows, selects key columns).
+   - Writes a cleaned CSV to a `/tmp` directory inside the Airflow container.
+   - Loads data into Snowflake using:
+     - an internal stage (PUT from local file to Snowflake),
+     - a staging table for bulk loads,
+     - and a MERGE step into the main fact table to avoid duplicates.
+   - All Snowflake work is done via `SnowflakeHook` with explicit transactions (commit / rollback), try-catch with raise error and logging.
 
-     - pickup / dropoff datetime
-     - pickup / dropoff zone IDs
-     - passenger count
-     - trip distance
-     - total amount
+2. **Real-Time Weather ETL – `nyc_weather_realtime_etl`**
+   - Calls OpenWeather’s **Current Weather** API on a schedule (for example, hourly).
+   - Reads the city and API key from Airflow Variables.
+   - Parses temperature, humidity, weather description, and keeps the raw JSON payload.
+   - Inserts one row per run into a Snowflake table that stores weather observations.
+   - Also uses `SnowflakeHook` with proper error handling and transactions.
 
-   - Drops invalid rows and filters out non-positive distance or amount.
-   - Optionally limits row count for resource-constrained environments.
-   - Writes a **single cleaned CSV** to `/tmp/nyc_taxi_cleaned_YYYY-MM/part-*.csv`.
+### Snowflake Storage
 
-3. **Load into Snowflake**
-   - Ensures schema, stage, file format, staging and fact tables exist (`CREATE ... IF NOT EXISTS`).
-   - Uses the Snowflake Python connector (via `SnowflakeHook`) to run:
+All raw data lands in a Snowflake **raw schema** (for example, `RAW`), including:
 
-     - `PUT file://... @<SCHEMA>.NYC_TAXI_STAGE`
-     - `COPY INTO <SCHEMA>.NYC_TAXI_TRIPS_STG ...`
-     - `MERGE` from staging into `<SCHEMA>.NYC_TAXI_TRIPS`
-     - `TRUNCATE` the staging table
+- A fact table for cleaned taxi trips (historical).  
+- A staging table used during COPY/MERGE of trip data.  
+- A fact table for weather observations (one row per DAG run).  
 
-   - All wrapped in a transaction with `commit` / `rollback` and logging.
+These raw tables become the foundation for downstream dbt models and BI dashboards.
 
 ---
 
-## Real-Time Weather Feed (Second Data Source)
+## Configuration
 
-**DAG:** `nyc_weather_realtime_etl`  
-**File:** `dags/weather_realtime_etl.py`
+### Snowflake Connection in Airflow
 
-This DAG provides the **real-time / near-real-time** data source required by the project, complementing the historical taxi archive.
+In the Airflow **Connections** UI, create a Snowflake connection (for example named `snowflake_catfish`) with:
 
-### What it does
+- account  
+- user  
+- password or key  
+- warehouse  
+- database  
+- role  
 
-On each run (e.g. hourly):
+The DAGs reference this connection ID via `SnowflakeHook`. No credentials are stored in this repository.
 
-1. **Ensure Weather Table Exists**
+### Airflow Variables
 
-   Creates a table in the same raw schema as the taxi data (schema name controlled by Airflow Variable `target_schema_raw`, e.g. `RAW`):
+Create the following Airflow Variables (in **Admin → Variables**):
 
-   ```sql
-   CREATE TABLE IF NOT EXISTS <SCHEMA>.RAW_WEATHER (
-     OBSERVED_AT   TIMESTAMP_NTZ,
-     CITY          STRING,
-     TEMP_F        FLOAT,
-     WEATHER_DESC  STRING,
-     HUMIDITY_PCT  NUMBER,
-     RAW_JSON      VARIANT,
-     LOAD_TS       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-   );
+- `target_schema_raw`  
+  - Example value: `RAW`  
+  - Used by both DAGs as the target schema for raw tables.
+
+- `openweather_api_key`  
+  - Your OpenWeather API key (see below).  
+  - Used by the weather DAG to authenticate with the OpenWeather API.
+
+- `weather_city` *(optional)*  
+  - Example value: `New York`  
+  - If not set, the weather DAG defaults to “New York”.
+
+---
+
+## OpenWeather API Key Setup
+
+1. Sign up and log in to OpenWeather.  
+2. Confirm your email address (required before keys work).  
+3. Go to the **API keys** page in your OpenWeather account dashboard.  
+4. Create or copy an API key.  
+5. Test your key in a browser by calling the Current Weather endpoint for New York with your key and units set to imperial (Fahrenheit). You should receive a JSON response with weather data, not a 401 error.
+6. In Airflow → **Admin → Variables**:
+   - Create a variable with key `openweather_api_key`.  
+   - Set the value to your API key token (only the token, no quotes or prefixes).
+
+> **Important:** Never commit your actual API key or Snowflake credentials to GitHub. Keep them only in Airflow or another secret manager.
+
+---
+
+## Verifying the Pipelines in Snowflake (Conceptual Checks)
+
+After running the DAGs, you can validate the results in Snowflake by:
+
+- **Taxi trips table (historical ETL):**
+  - Ensure the table in the raw schema exists.
+  - Check that it has a non-zero row count.
+  - Inspect sample rows to confirm pickup/dropoff timestamps, zones, distances, and amounts look reasonable.
+  - Confirm the date range matches the month you expect (based on the file the DAG selected).
+
+- **Weather observations table (real-time ETL):**
+  - Ensure the table exists in the raw schema.
+  - Verify that each run of `nyc_weather_realtime_etl` adds a new row.
+  - Check that observed timestamps and load timestamps are recent.
+  - Confirm temperature, humidity, and descriptions look realistic for the chosen city.
+
+You can perform these checks with simple “select a few rows” and “count rows” queries in the Snowflake worksheet, without needing any special tooling.
+
+---
+
+## How This Supports the Project Requirements
+
+This setup directly addresses the core project requirements:
+
+- Uses **two data sources**:
+  - A historical archive (NYC taxi trip data) loaded in batch via PySpark and Airflow.
+  - A near real-time feed (weather conditions) pulled from the OpenWeather API.
+
+- Demonstrates:
+  - **Airflow** for orchestration and scheduling.  
+  - **PySpark** for transformation of large historical files.  
+  - **Snowflake** as the central cloud data warehouse.
+
+- Produces raw fact tables that can be:
+  - Joined (trips + weather) by time and zone in dbt models.
+  - Used to analyze demand and delays by weather.
+  - Used to power simple forecasting and live indicators in BI dashboards.
