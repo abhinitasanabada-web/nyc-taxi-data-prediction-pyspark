@@ -93,7 +93,7 @@ Create the following Airflow Variables (in **Admin → Variables**):
    - Create a variable with key `openweather_api_key`.  
    - Set the value to your API key token (only the token, no quotes or prefixes).
 
-> **Important:** Never commit your actual API key or Snowflake credentials to GitHub. Keep them only in Airflow or another secret manager.
+
 
 ---
 
@@ -117,6 +117,7 @@ You can perform these checks with simple “select a few rows” and “count ro
 
 ---
 
+
 ## How This Supports the Project Requirements
 
 This setup directly addresses the core project requirements:
@@ -134,3 +135,57 @@ This setup directly addresses the core project requirements:
   - Joined (trips + weather) by time and zone in dbt models.
   - Used to analyze demand and delays by weather.
   - Used to power simple forecasting and live indicators in BI dashboards.
+ 
+## Verifying the Pipelines in Snowflake
+
+After your Airflow DAGs run, you can confirm that everything worked by checking the tables in Snowflake.
+
+### 1. Verify Taxi Trips (Historical ETL)
+
+In a Snowflake worksheet, run simple checks against your raw schema (for example `RAW`):
+
+- Check that the trips table exists and has rows:
+
+```sql
+
+SELECT COUNT(*) AS trip_count
+FROM RAW.NYC_TAXI_TRIPS;
+
+Inspect a few sample rows:
+
+SELECT *
+FROM RAW.NYC_TAXI_TRIPS
+LIMIT 20;
+
+
+Confirm the date range of the loaded data:
+
+SELECT
+  MIN(PICKUP_DATETIME) AS first_pickup,
+  MAX(PICKUP_DATETIME) AS last_pickup
+FROM RAW.NYC_TAXI_TRIPS;
+
+
+You should see a reasonable number of rows, and the pickup dates should match the most recent month that your ETL DAG downloaded. 
+---
+
+ 2. Verify Weather Observations (Real-Time ETL)
+
+For the real-time weather DAG (nyc_weather_realtime_etl), check that the weather table is being populated:
+
+Confirm there are rows, and see the latest entries:
+
+SELECT
+  OBSERVED_AT,
+  CITY,
+  TEMP_F,
+  WEATHER_DESC,
+  HUMIDITY_PCT,
+  LOAD_TS
+FROM RAW.RAW_WEATHER
+ORDER BY LOAD_TS DESC
+LIMIT 10;
+
+
+You should see one new row each time the DAG runs, with LOAD_TS and OBSERVED_AT close to the Airflow execution time, and realistic values for temperature, humidity, and description.
+
